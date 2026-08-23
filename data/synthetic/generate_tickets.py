@@ -15,7 +15,7 @@
 #
 # HOW IT WORKS:
 # Step 1 — We define seed templates for each module and issue type
-# Step 2 — We call Groq API to generate realistic variations of each seed
+# Step 2 — We call LLM API (Google Gemini) to generate realistic variations of each seed
 # Step 3 — We save everything to two CSV files:
 #           - incoming_tickets.csv  (messy, unstructured, what users write)
 #           - resolved_tickets.csv  (structured, what consultants document)
@@ -24,9 +24,11 @@
 import os
 import re
 import csv
+import sys
 import json
 import time
 import math
+import signal
 import random
 import requests
 from datetime import datetime, timedelta
@@ -39,25 +41,36 @@ load_dotenv()
 # CONFIGURATION
 # =============================================================================
 # Read API key from environment variable — never hardcode API keys in code
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
+# GROQ_API_KEY   = os.environ.get("GROQ_API_KEY", "")
+# GROQ_FAST_MODEL = os.environ.get("GROQ_FAST_MODEL", "openai/gpt-oss-20b")
+# GROQ_BASE_URL  = os.environ.get("GROQ_BASE_URL", "https://api.groq.com/openai/v1")
+# GROQ_URL       = f"{GROQ_BASE_URL.rstrip('/')}/chat/completions"
 
-# We use the fast model for data generation — speed matters more than quality
-# here since we are generating 25,000 tickets
-GROQ_FAST_MODEL = os.environ.get("GROQ_FAST_MODEL", "openai/gpt-oss-20b")
+# Google Gemini API configuration
+# API key — get a free key at aistudio.google.com
+GEMINI_API_KEY  = os.environ.get("GEMINI_API_KEY", "")
 
-# Base URL configurable via environment variable (default: Groq OpenAI-compatible v1 base URL)
-GROQ_BASE_URL = os.environ.get("GROQ_BASE_URL", "https://api.groq.com/openai/v1")
-GROQ_URL = f"{GROQ_BASE_URL.rstrip('/')}/chat/completions"
+# Model name — configurable via environment variable
+GEMINI_MODEL    = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash-lite")
+
+# Base URL — configurable via environment variable, not hardcoded
+# Default is Google's OpenAI-compatible Gemini endpoint
+GEMINI_BASE_URL = os.environ.get("GEMINI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai")
+GEMINI_URL      = f"{GEMINI_BASE_URL.rstrip('/')}/chat/completions"
 
 # Output file paths
 INCOMING_CSV  = "data/synthetic/incoming_tickets.csv"
 RESOLVED_CSV  = "data/synthetic/resolved_tickets.csv"
 
+# Progress checkpoint file — gitignored, runtime artifact only
+# Allows the script to resume from the last completed seed on restart
+PROGRESS_FILE = "data/synthetic/generation_progress.json"
+
 # Target counts & multi-pass configuration
-TARGET_INCIDENTS = 15000
+TARGET_INCIDENTS   = 15000
 TARGET_DEVELOPMENT = 6500
-TARGET_EDGE_CASES = 3500
-VARIATIONS_PER_PASS = 20
+TARGET_EDGE_CASES  = 3500
+VARIATIONS_PER_PASS = 20   # Number of variations requested per API call
 
 # =============================================================================
 # SAP MODULES
@@ -767,7 +780,8 @@ RESOLUTION_TEMPLATES = {
     },
 }
 
-# Default resolution for combinations that may not lie in any of above categories. This is a fallback to ensure that every generated ticket has a resolution.
+# Default resolution for combinations that may not lie in any of above categories.
+# This is a fallback to ensure that every generated ticket has a resolution.
 DEFAULT_RESOLUTION = {
     "root_cause":    "Issue identified in {module} module related to {issue_type}",
     "fix":           "1. Investigated the issue in relevant SAP transactions\n2. Identified root cause through system analysis\n3. Applied configuration or master data fix\n4. Tested with affected user and confirmed resolution",
@@ -776,41 +790,226 @@ DEFAULT_RESOLUTION = {
 }
 
 
+# =============================================================================
+# PROGRESS CHECKPOINT HELPERS
+# These functions enable the generator to resume from exactly the last
+# completed seed within each pass after any interruption.
+# =============================================================================
+
+def load_progress() -> dict:
+    """
+    Load generation progress from the checkpoint file.
+
+    WHY THIS EXISTS: Allows the generator to resume from exactly where it
+    stopped at the seed level within each pass. Without this, every restart
+    would overwrite the CSVs and start from zero.
+
+    Returns a progress dict with all counts zeroed if no checkpoint file
+    exists — this means fresh start. Same code path handles both cases.
+    """
+    if not os.path.exists(PROGRESS_FILE):
+        # No checkpoint — return zeroed structure for a fresh start
+        return {
+            "incidents": {
+                "completed_passes": 0,
+                "completed_seeds_in_current_pass": [],
+                "total_count": 0,
+            },
+            "development": {
+                "completed_passes": 0,
+                "completed_seeds_in_current_pass": [],
+                "total_count": 0,
+            },
+            "edge_cases": {
+                "completed_passes": 0,
+                "completed_seeds_in_current_pass": [],
+                "total_count": 0,
+            },
+            "last_updated": None,
+        }
+    with open(PROGRESS_FILE, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def save_progress(progress: dict) -> None:
+    """
+    Save current generation progress to the checkpoint file.
+
+    WHY THIS EXISTS: Called after every seed completes and its rows are
+    flushed to disk via os.fsync(). This is the finest safe checkpoint
+    granularity — if the script stops mid-seed we lose at most one API
+    call (20 tickets). inspect_data.ipynb removes duplicates.
+
+    IMPORTANT: save_progress() is deliberately NOT called when a seed
+    returns an empty list (API failure). This means the seed's position
+    in completed_seeds_in_current_pass is never advanced, so the resume
+    logic on the next run will naturally retry the failed seed and append
+    its rows to the CSV. Append mode + inspect_data sorting handles order.
+    """
+    progress["last_updated"] = datetime.now().isoformat()
+    os.makedirs(os.path.dirname(PROGRESS_FILE), exist_ok=True)
+    with open(PROGRESS_FILE, "w", encoding="utf-8") as f:
+        json.dump(progress, f, indent=2)
+
+
+# =============================================================================
+# GRACEFUL SHUTDOWN HANDLER
+# =============================================================================
+
+def handle_shutdown(signum, frame):
+    """
+    Handle Ctrl+C (SIGINT) and system termination (SIGTERM) gracefully.
+
+    WHY THIS EXISTS: Progress is saved after every successful seed, so no
+    data is lost on shutdown. This handler prints a clear message so the
+    user knows the script is safe to close and can be resumed.
+    """
+    print("\n\nShutdown signal received.")
+    print("Progress is saved. Run the script again to resume from checkpoint.")
+    print(f"Checkpoint: {PROGRESS_FILE}")
+    sys.exit(0)
+
+# Register shutdown handler for keyboard interrupt and system signals
+signal.signal(signal.SIGINT,  handle_shutdown)
+signal.signal(signal.SIGTERM, handle_shutdown)
+
 
 # =============================================================================
 # GROQ API CALL
 # This function calls the Groq API to generate text variations.
 # It takes a prompt describing what to generate and returns the LLM response.
 # =============================================================================
-def call_groq(prompt: str, max_tokens: int = 800) -> str:
-    """
-    Call the Groq API with a prompt and return the generated text.
+# call_groq() kept below for reference — replaced by call_llm()
+# def call_groq(prompt: str, max_tokens: int = 800) -> str:
+#     """
+#     Call the Groq API with a prompt and return the generated text.
+# 
+#     WHY GROQ: Free tier, fast inference (1000 tokens/sec on fast model),
+#     no credit card required. We use gpt-oss-20b (fast model) here because
+#     we are generating 25,000 tickets and speed matters more than quality.
+# 
+#     Args:
+#         prompt: The instruction telling the LLM what to generate
+#         max_tokens: Maximum length of the response
+# 
+#     Returns:
+#         The generated text as a string, or empty string if API call fails
+#     """
+#     if not GROQ_API_KEY:
+#         raise ValueError(
+#             "GROQ_API_KEY not set. Set it as an environment variable:\n"
+#             "Windows: set GROQ_API_KEY=your_key_here\n"
+#             "Mac/Linux: export GROQ_API_KEY=your_key_here"
+#         )
+# 
+#     headers = {
+#         "Authorization": f"Bearer {GROQ_API_KEY}",
+#         "Content-Type":  "application/json",
+#     }
+# 
+#     payload = {
+#         "model":      GROQ_FAST_MODEL,
+#         "max_tokens": max_tokens,
+#         "messages": [
+#             {
+#                 "role":    "system",
+#                 "content": (
+#                     "You are a data generation assistant. Generate exactly what "
+#                     "is asked — nothing more, nothing less. No explanations, no "
+#                     "preamble, no formatting unless asked. Output only the "
+#                     "requested data in the exact format specified."
+#                 ),
+#             },
+#             {
+#                 "role":    "user",
+#                 "content": prompt,
+#             },
+#         ],
+#     }
+# 
+#     # Maximum 3 attempts. On all retries exhausted, return "" so the caller
+#     # knows the seed failed and can skip it without saving progress.
+#     max_retries = 3
+#     for attempt in range(max_retries):
+#         try:
+#             response = requests.post(GROQ_URL, headers=headers, json=payload, timeout=30)
+# 
+#             if response.status_code == 429:
+#                 # Rate limit hit — flat 20-second wait regardless of attempt number.
+#                 # Flat (not exponential) because Groq's free tier resets every ~15-20s.
+#                 # Exponential would overshoot the reset window unnecessarily.
+#                 print(f"  Rate limit (429) — waiting 20s flat (attempt {attempt + 1}/{max_retries})...")
+#                 time.sleep(20)
+#                 continue
+# 
+#             response.raise_for_status()
+#             return response.json()["choices"][0]["message"]["content"].strip()
+# 
+#         except requests.exceptions.Timeout:
+#             # Network timeout — flat 5-second wait then retry
+#             print(f"  Timeout — retrying in 5s (attempt {attempt + 1}/{max_retries})...")
+#             time.sleep(5)
+# 
+#         except requests.exceptions.HTTPError as e:
+#             # Non-429 HTTP error (e.g. 500, 503) — not retriable
+#             print(f"  HTTP error: {e}")
+#             break
+# 
+#         except Exception as e:
+#             # Unexpected error — not retriable
+#             print(f"  Unexpected error calling Groq: {e}")
+#             break
+# 
+#     # All retries exhausted — return empty string so caller can skip this seed
+#     return ""
 
-    WHY GROQ: Free tier, fast inference (1000 tokens/sec on fast model),
-    no credit card required. We use gpt-oss-20b (fast model) here because
-    we are generating 25,000 tickets and speed matters more than quality.
+
+def call_llm(prompt: str, max_tokens: int = 800) -> str:
+    """
+    Call the Google Gemini API with a prompt and return the generated text.
+
+    WHY THIS EXISTS: Generates realistic SAP support ticket variations
+    from seed templates using an LLM. The LLM produces genuinely varied
+    linguistic patterns — different vocabulary, tone, length, panic level —
+    which a pure template system cannot match.
+
+    WHY GEMINI: Free tier provides 1,000 requests per day, enough to
+    generate 20,000 ticket variations per day. The OpenAI-compatible
+    endpoint means request and response format is identical to the
+    previous provider — only the URL and API key differ.
+
+    Retry strategy:
+    - Rate limit (429): flat 40 second wait, then retry
+      Flat rather than exponential because per-minute limits
+      reset on a fixed window, not a rolling one
+    - Timeout: 5 second wait, then retry
+    - Other HTTP errors: log and break immediately, not retriable
+    - Maximum 3 attempts per call before returning empty string
+
+    Returns empty string on total failure so the caller can skip
+    this seed and retry next run via the checkpoint system.
 
     Args:
         prompt: The instruction telling the LLM what to generate
         max_tokens: Maximum length of the response
 
     Returns:
-        The generated text as a string, or empty string if API call fails
+        The generated text as a string, or empty string if all retries fail
     """
-    if not GROQ_API_KEY:
+    if not GEMINI_API_KEY:
         raise ValueError(
-            "GROQ_API_KEY not set. Set it as an environment variable:\n"
-            "Windows: set GROQ_API_KEY=your_key_here\n"
-            "Mac/Linux: export GROQ_API_KEY=your_key_here"
+            "GEMINI_API_KEY not set. Get a free key at aistudio.google.com\n"
+            "Windows:   set GEMINI_API_KEY=your_key_here\n"
+            "Mac/Linux: export GEMINI_API_KEY=your_key_here"
         )
 
     headers = {
-        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Authorization": f"Bearer {GEMINI_API_KEY}",
         "Content-Type":  "application/json",
     }
 
     payload = {
-        "model":      GROQ_FAST_MODEL,
+        "model":      GEMINI_MODEL,
         "max_tokens": max_tokens,
         "messages": [
             {
@@ -829,28 +1028,45 @@ def call_groq(prompt: str, max_tokens: int = 800) -> str:
         ],
     }
 
-    try:
-        response = requests.post(GROQ_URL, headers=headers, json=payload, timeout=30)
-        response.raise_for_status()
-        return response.json()["choices"][0]["message"]["content"].strip()
+    # Maximum 3 attempts before giving up and returning empty string
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            response = requests.post(
+                GEMINI_URL, headers=headers, json=payload, timeout=30
+            )
 
-    except requests.exceptions.Timeout:
-        print("  Warning: Groq API timeout, retrying after 5 seconds...")
-        time.sleep(5)
-        return ""
+            if response.status_code == 429:
+                # Per-minute rate limit hit — flat 40 second wait
+                # Flat rather than exponential because the rate limit
+                # window resets on a fixed schedule
+                print(f"  Rate limit (429) — waiting 40s flat "
+                      f"(attempt {attempt + 1}/{max_retries})...")
+                time.sleep(40)
+                continue
 
-    except requests.exceptions.HTTPError as e:
-        if response.status_code == 429:
-            # 429 = rate limit hit — wait and retry
-            print("  Rate limit hit, waiting 10 seconds...")
-            time.sleep(10)
-            return ""
-        print(f"  HTTP error: {e}")
-        return ""
+            response.raise_for_status()
+            return response.json()["choices"][0]["message"]["content"].strip()
 
-    except Exception as e:
-        print(f"  Unexpected error calling Groq: {e}")
-        return ""
+        except requests.exceptions.Timeout:
+            # Network timeout — short wait then retry
+            print(f"  Timeout — retrying in 5s "
+                  f"(attempt {attempt + 1}/{max_retries})...")
+            time.sleep(5)
+
+        except requests.exceptions.HTTPError as e:
+            # Non-429 HTTP error — not worth retrying
+            print(f"  HTTP error: {e}")
+            break
+
+        except Exception as e:
+            # Unexpected error — not retriable
+            print(f"  Unexpected error: {e}")
+            break
+
+    # All retries exhausted — return empty string
+    # Caller must NOT save progress for this seed so it retries next run
+    return ""
 
 
 # =============================================================================
@@ -905,11 +1121,13 @@ Rules:
 - Output ONLY the {count} ticket texts, one per line, numbered 1 to {count}
 - No explanations, no labels, just the ticket texts"""
 
-    response = call_groq(prompt, max_tokens=1200)
+    response = call_llm(prompt, max_tokens=800)
 
     if not response:
-        # If API call failed, return the seed itself as fallback
-        return [seed_with_code]
+        # API call failed after all retries — return empty list.
+        # Caller must write nothing, skip save_progress(), print a warning,
+        # and let the resume logic retry this seed on the next run.
+        return []
 
     # Robust regex line parser to strip numbered list prefixes (e.g. "1. ", "1) ")
     # without corrupting ticket texts starting with digits (e.g. "1000 plant issue")
@@ -924,9 +1142,10 @@ Rules:
         if cleaned_text:
             variations.append(cleaned_text)
 
-    # Make sure we have at least one variation
-    if not variations:
-        variations = [seed_with_code]
+    # Accept 75% threshold (15+ variations out of 20) as a successful call
+    # to prevent unnecessary retries when Groq returns slightly fewer variations.
+    if not variations or len(variations) < int(count * 0.75):
+        return []
 
     return variations[:count]
 
@@ -967,10 +1186,11 @@ Rules:
 - Output ONLY the {count} texts, one per line, numbered 1 to {count}
 - No explanations, just the request texts"""
 
-    response = call_groq(prompt, max_tokens=1000)
+    response = call_llm(prompt, max_tokens=700)
 
     if not response:
-        return [seed_text]
+        # API call failed — return empty list so caller skips and retries next run
+        return []
 
     lines = response.strip().split("\n")
     variations = []
@@ -979,12 +1199,15 @@ Rules:
         line = line.strip()
         if not line:
             continue
+        # Strip numbered list prefixes, preserving text that starts with digits
         cleaned_text = re.sub(r"^\d+[\.\)\-]\s*", "", line).strip()
         if cleaned_text:
             variations.append(cleaned_text)
 
-    if not variations:
-        variations = [seed_text]
+    # Accept 75% threshold (15+ variations out of 20) as a successful call
+    # to prevent unnecessary retries when Groq returns slightly fewer variations.
+    if not variations or len(variations) < int(count * 0.75):
+        return []
 
     return variations[:count]
 
@@ -1101,36 +1324,120 @@ def generate_all_tickets():
     Main function that generates all 25,000 synthetic tickets.
 
     Generation breakdown:
-    - 15,000 incident tickets (from INCIDENT_SEEDS × VARIATIONS_PER_SEED)
-    - 6,500 new development requests (from DEVELOPMENT_SEEDS × variations)
-    - 3,500 edge cases (from EDGE_CASE_SEEDS × variations)
+    - 15,000 incident tickets  (INCIDENT_SEEDS x VARIATIONS_PER_PASS x N passes)
+    -  6,500 development requests (DEVELOPMENT_SEEDS x VARIATION_PER_PASS x N passes)
+    -  3,500 edge cases (EDGE_CASE_SEEDS x VARIATION_PER_PASS x N passes)
 
     Output files:
     - incoming_tickets.csv: all ticket texts with labels (for BERT training)
     - resolved_tickets.csv: structured resolutions (for RAG knowledge base)
+
+    Resume behaviour:
+    - If PROGRESS_FILE and INCOMING_CSV both exist with data, the script
+      resumes from the last completed seed. Already-written rows are preserved.
+    - If either file is absent, the script starts fresh.
+
+    Failed seed behaviour (Task 1):
+    - When a seed's API call returns [] after 3 retries, zero rows are written
+      to either CSV. save_progress() is NOT called for that seed, so
+      completed_seeds_in_current_pass is not advanced. The next run's resume
+      skip logic will not skip that seed — it retries it and appends its rows.
+      inspect_data.ipynb sorts and deduplicates, so append order does not matter.
     """
-    print("=" * 60)
-    print("ARIA Synthetic Data Generator")
-    print("=" * 60)
-    print(f"Model: {GROQ_FAST_MODEL}")
-    print(f"Target: 25,000 tickets (15k incident, 6.5k dev, 3.5k edge)")
-    print("=" * 60)
+
+    # ── RESUME DETECTION ──────────────────────────────────────────────────
+    # load_progress() returns all-zeros when no checkpoint file exists,
+    # so fresh-start and resume use exactly the same code path from here.
+    progress = load_progress()
+
+    # Track progress counts and daily limit exhaustion status across all phases
+    inc_count  = progress["incidents"]["total_count"]
+    dev_count  = progress["development"]["total_count"]
+    edge_count = progress["edge_cases"]["total_count"]
+    daily_limit_exhausted = False
+
+    # Determine if this is a resume by checking whether the CSV already
+    # exists and has data in it (more than just the header row)
+    is_resuming = (
+        os.path.exists(INCOMING_CSV)
+        and os.path.getsize(INCOMING_CSV) > 0
+    )
+
+    if is_resuming:
+        # Count existing rows by type so the summary is accurate
+        existing_incidents   = 0
+        existing_development = 0
+        existing_edge_cases  = 0
+        with open(INCOMING_CSV, "r", encoding="utf-8") as check_file:
+            for row in csv.DictReader(check_file):
+                if   row["ticket_type"] == "incident":    existing_incidents   += 1
+                elif row["ticket_type"] == "development": existing_development += 1
+                elif row["ticket_type"] == "edge_case":   existing_edge_cases  += 1
+
+        print("=" * 55)
+        print("RESUME MODE — continuing from checkpoint")
+        print(f"Incidents:   {existing_incidents:,} / {TARGET_INCIDENTS:,}")
+        print(f"Development: {existing_development:,} / {TARGET_DEVELOPMENT:,}")
+        print(f"Edge Cases:  {existing_edge_cases:,} / {TARGET_EDGE_CASES:,}")
+        print(f"Last saved:  {progress['last_updated']}")
+        print("=" * 55)
+
+        # Append mode — preserve all existing rows, no headers written again
+        inc_file_mode = "a"
+        write_headers = False
+    else:
+        print("=" * 55)
+        print("FRESH START — generating 25,000 tickets")
+        print(f"Model:       {GEMINI_MODEL}")
+        print(f"Incidents:   {TARGET_INCIDENTS:,}")
+        print(f"Development: {TARGET_DEVELOPMENT:,}")
+        print(f"Edge Cases:  {TARGET_EDGE_CASES:,}")
+        print("=" * 55)
+
+        # Write mode — create new files, headers written once
+        inc_file_mode = "w"
+        write_headers = True
+
+    # WHY THIS EXISTS: When resuming from a checkpoint in append mode ('a'),
+    # starting ticket_counter at 1 would re-issue existing ticket IDs (e.g. INC-000001).
+    # We inspect existing IDs in INCOMING_CSV to resume ticket_counter from max_num + 1.
+    if is_resuming:
+        # Find the highest ticket number already written to avoid duplicate IDs
+        # ticket_id format is INC-000001, DEV-000006, EDG-000012 etc.
+        # Extract the numeric part and find the maximum across all rows
+        max_ticket_num = 0
+        with open(INCOMING_CSV, "r", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                tid = row.get("ticket_id", "")
+                if "-" in tid:
+                    try:
+                        num = int(tid.split("-")[1])
+                        if num > max_ticket_num:
+                            max_ticket_num = num
+                    except ValueError:
+                        pass
+        ticket_counter = max_ticket_num + 1
+        print(f"Resuming ticket IDs from: {ticket_counter:,}")
+    else:
+        ticket_counter = 1
 
     # Make sure output directory exists
     os.makedirs("data/synthetic", exist_ok=True)
 
     # ── FIELD DEFINITIONS ─────────────────────────────────────────────────
     # incoming_tickets.csv fields:
-    # - ticket_id:    unique ID
-    # - text:         the raw ticket text as the user would write it
-    # - ticket_type:  incident / development / edge_case
-    # - module:       FI, MM, SD, PP, BASIS, ABAP, HR (or "cross_module")
-    # - issue_type:   Authorization, Configuration, etc. (empty for dev requests)
+    # - ticket_id:      unique ID (INC-XXXXXX, DEV-XXXXXX, EDG-XXXXXX)
+    # - text:           the raw ticket text as the user would write it
+    # - ticket_type:    incident / development / edge_case
+    # - module:         FI, MM, SD, PP, BASIS, ABAP, HR
+    # - issue_type:     Authorization, Configuration, etc. (empty for dev)
     # - has_error_code: True/False — whether ticket contains an SAP error code
-    # - error_code:   the actual error code if present, empty string if not
+    # - error_code:     the actual error code if present, empty string if not
     #
     # resolved_tickets.csv fields (only for incident and edge case tickets):
-    # - All incoming fields PLUS structured resolution information
+    # - ticket_id, module, issue_type, problem, error_code,
+    #   root_cause, fix, tcodes_used, resolution_time_minutes,
+    #   escalated, created_date, resolved_date, ticket_type
 
     incoming_fields = [
         "ticket_id", "text", "ticket_type", "module",
@@ -1143,227 +1450,495 @@ def generate_all_tickets():
         "escalated", "created_date", "resolved_date", "ticket_type",
     ]
 
-    # Counters to track progress across all categories
-    total_incoming  = 0
-    total_resolved  = 0
-    ticket_counter  = 1  # For generating unique sequential ticket IDs
-    inc_count       = 0  # Category counter for incident tickets
-    dev_count       = 0  # Category counter for development requests
-    edge_count      = 0  # Category counter for edge case tickets
-
     # ── OPEN CSV FILES ────────────────────────────────────────────────────
-    with open(INCOMING_CSV, "w", newline="", encoding="utf-8") as inc_file, \
-         open(RESOLVED_CSV, "w", newline="", encoding="utf-8") as res_file:
+    with open(INCOMING_CSV, inc_file_mode, newline="", encoding="utf-8") as inc_file, \
+         open(RESOLVED_CSV, inc_file_mode, newline="", encoding="utf-8") as res_file:
 
         inc_writer = csv.DictWriter(inc_file, fieldnames=incoming_fields)
         res_writer = csv.DictWriter(res_file, fieldnames=resolved_fields)
 
-        inc_writer.writeheader()
-        res_writer.writeheader()
+        # Write headers only on fresh start — resuming would duplicate the header row
+        if write_headers:
+            inc_writer.writeheader()
+            res_writer.writeheader()
 
-        # ── PHASE 1: INCIDENT TICKETS ─────────────────────────────────────
-        # Calculate full passes over INCIDENT_SEEDS required to hit TARGET_INCIDENTS (15,000).
-        # 59 seeds × 20 variations/pass = 1,180 tickets per pass.
-        # ceil(15,000 / 1,180) = 13 passes required.
-        INCIDENT_PASSES = math.ceil(TARGET_INCIDENTS / (len(INCIDENT_SEEDS) * VARIATIONS_PER_PASS))
-        print("\nPHASE 1: Generating incident tickets...")
-        print(f"Seeds: {len(INCIDENT_SEEDS)} | Passes: {INCIDENT_PASSES} | Target: {TARGET_INCIDENTS:,}")
+        # ── PHASE 1: INCIDENT TICKETS ──────────────────────────────────────
+        # PASS-FIRST ordering: Pass 1 processes all 58 seeds, then Pass 2
+        # processes all 58 seeds again, and so on. This is intentional —
+        # pass-first produces better linguistic diversity because the LLM
+        # generates fresh variations on each pass. Do not change to seed-first.
+        #
+        # Math: 58 seeds × 20 variations/pass = 1,160 per pass
+        # ceil(15,000 / 1,160) = 13 passes required
+
+        INCIDENT_PASSES = math.ceil(
+            TARGET_INCIDENTS / (len(INCIDENT_SEEDS) * VARIATIONS_PER_PASS)
+        )
+        print(f"\nPHASE 1: Generating {TARGET_INCIDENTS:,} incident tickets")
+        print(f"Seeds: {len(INCIDENT_SEEDS)} | Passes: {INCIDENT_PASSES} | "
+              f"Variations per call: {VARIATIONS_PER_PASS}")
         print("-" * 40)
+
+        # Restore count from checkpoint — 0 on fresh start
+        inc_count = progress["incidents"]["total_count"]
 
         for pass_idx in range(INCIDENT_PASSES):
             if inc_count >= TARGET_INCIDENTS:
                 break
-            print(f"\n--- Incident Pass {pass_idx + 1}/{INCIDENT_PASSES} ---")
-            for i, (module, issue_type, has_error_code, seed_text) in enumerate(INCIDENT_SEEDS):
-                if inc_count >= TARGET_INCIDENTS:
-                    break
-                print(f"[{i+1}/{len(INCIDENT_SEEDS)}] {module} - {issue_type}", end="")
 
-                # Pick a random error code for this module if the seed uses one
-                error_code = ""
-                if has_error_code:
-                    error_code = random.choice(ERROR_CODES.get(module, ["SY 001"]))
+            completed_passes = progress["incidents"]["completed_passes"]
+            if pass_idx < completed_passes:
+                continue   # Entire pass already done in a previous run
 
-                # Generate variations using the LLM via Groq API call
-                variations = generate_incoming_variations(
-                    seed_text      = seed_text,
-                    module         = module,
-                    issue_type     = issue_type,
-                    has_error_code = has_error_code,
-                    error_code     = error_code,
-                    count          = VARIATIONS_PER_PASS,
-                )
+            # ── PASS RETRY LOOP ──────────────────────────────────────────────
+            # WHY THIS EXISTS: Tracks consecutive empty/failed iterations across all seeds in a pass.
+            # If rate limits or API outages cause 5 consecutive iterations where zero seeds succeed,
+            # we break gracefully to avoid infinite loops and allow resuming later.
+            consecutive_empty_passes = 0
+            while (len(progress["incidents"]["completed_seeds_in_current_pass"]) < len(INCIDENT_SEEDS)
+                   and inc_count < TARGET_INCIDENTS):
 
-                print(f" -> {len(variations)} tickets")
+                missing_indices = [
+                    i for i in range(len(INCIDENT_SEEDS))
+                    if i not in progress["incidents"]["completed_seeds_in_current_pass"]
+                ]
 
-                for ticket_text in variations:
+                seed_succeeded_this_iter = False
+                for seed_idx in missing_indices:
                     if inc_count >= TARGET_INCIDENTS:
                         break
-                    ticket_id = f"INC-{ticket_counter:06d}"
-                    ticket_counter += 1
 
-                    # Write to incoming tickets CSV (unstructured raw user text)
-                    inc_writer.writerow({
-                        "ticket_id":     ticket_id,
-                        "text":          ticket_text,
-                        "ticket_type":   "incident",
-                        "module":        module,
-                        "issue_type":    issue_type,
-                        "has_error_code": has_error_code,
-                        "error_code":    error_code,
-                    })
+                    module, issue_type, has_error_code, seed_text = INCIDENT_SEEDS[seed_idx]
 
-                    # Write structured resolution record to resolved tickets CSV (for RAG DB)
-                    resolved = build_resolved_record(
-                        incoming_text = ticket_text,
-                        module        = module,
-                        issue_type    = issue_type,
-                        error_code    = error_code,
-                        ticket_id     = ticket_id,
+                    # Pick a random error code for seeds that require one
+                    error_code = ""
+                    if has_error_code:
+                        error_code = random.choice(ERROR_CODES.get(module, ["SY 001"]))
+
+                    print(f"  Pass {pass_idx + 1}/{INCIDENT_PASSES} | "
+                          f"Seed {seed_idx + 1}/{len(INCIDENT_SEEDS)} | "
+                          f"{module} - {issue_type}", end="")
+
+                    # One API call generates VARIATIONS_PER_PASS (20) variations
+                    variations = generate_incoming_variations(
+                        seed_text      = seed_text,
+                        module         = module,
+                        issue_type     = issue_type,
+                        has_error_code = has_error_code,
+                        error_code     = error_code,
                     )
-                    res_writer.writerow(resolved)
 
-                    total_incoming += 1
-                    total_resolved += 1
-                    inc_count += 1
+                    print(f" -> {len(variations)} tickets")
 
-                # Small delay between API calls to avoid Groq rate limits (30 req/min free tier)
-                time.sleep(2)
+                    if not variations or len(variations) < int(VARIATIONS_PER_PASS * 0.75):
+                        # API returned [] or fewer than 75% threshold (15) variations.
+                        # Do NOT write to CSV, do NOT save progress. Seed remains
+                        # in missing_indices and will be retried in the next while-loop iteration.
+                        print(f"  WARNING: Seed {seed_idx + 1} in Pass {pass_idx + 1} "
+                              f"did not return sufficient variations (>=75%) — retrying seed")
+                        continue
+
+                    # Write all variations to both CSVs
+                    for ticket_text in variations:
+                        if inc_count >= TARGET_INCIDENTS:
+                            break
+
+                        ticket_id = f"INC-{ticket_counter:06d}"
+                        ticket_counter += 1
+
+                        # Write incoming ticket row (raw user text, for BERT training)
+                        inc_writer.writerow({
+                            "ticket_id":      ticket_id,
+                            "text":           ticket_text,
+                            "ticket_type":    "incident",
+                            "module":         module,
+                            "issue_type":     issue_type,
+                            "has_error_code": has_error_code,
+                            "error_code":     error_code,
+                        })
+
+                        # Write resolved record side-by-side — incidents always
+                        # get a resolved record because they feed the RAG DB
+                        resolved = build_resolved_record(
+                            incoming_text = ticket_text,
+                            module        = module,
+                            issue_type    = issue_type,
+                            error_code    = error_code,
+                            ticket_id     = ticket_id,
+                        )
+                        res_writer.writerow(resolved)
+                        inc_count += 1
+
+                    # Flush both files to disk (physical write via os.fsync)
+                    inc_file.flush()
+                    os.fsync(inc_file.fileno())
+                    res_file.flush()
+                    os.fsync(res_file.fileno())
+
+                    # Record seed as completed for this pass ONLY after all rows are written
+                    if seed_idx not in progress["incidents"]["completed_seeds_in_current_pass"]:
+                        progress["incidents"]["completed_seeds_in_current_pass"].append(seed_idx)
+                    progress["incidents"]["total_count"] = inc_count
+                    save_progress(progress)
+
+                    seed_succeeded_this_iter = True
+
+                    # 5 second delay between API calls — respects 15 RPM free tier limit
+                    time.sleep(5)
+
+                if seed_succeeded_this_iter:
+                    consecutive_empty_passes = 0
+                else:
+                    consecutive_empty_passes += 1
+
+                if consecutive_empty_passes >= 5:
+                    print("\n" + "=" * 55)
+                    print("DAILY RATE LIMIT EXHAUSTED")
+                    print("All seeds returned empty 5 consecutive times.")
+                    print("Progress saved. Run script again tomorrow.")
+                    print("Current progress:")
+                    print(f"  Incidents:   {inc_count:,} / {TARGET_INCIDENTS:,}")
+                    print(f"  Development: {dev_count:,} / {TARGET_DEVELOPMENT:,}")
+                    print(f"  Edge Cases:  {edge_count:,} / {TARGET_EDGE_CASES:,}")
+                    print("=" * 55)
+                    daily_limit_exhausted = True
+                    break
+
+                # If missing seeds remain, print status before retrying them
+                remaining = len(INCIDENT_SEEDS) - len(progress["incidents"]["completed_seeds_in_current_pass"])
+                if remaining > 0 and inc_count < TARGET_INCIDENTS:
+                    print(f"  [Pass {pass_idx + 1}] Retrying {remaining} uncompleted seed(s)...")
+                    time.sleep(3)
+
+            if daily_limit_exhausted:
+                break
+
+            # ── END OF PASS ────────────────────────────────────────────────
+            # Increment completed_passes ONLY when ALL seeds in this pass are done
+            if (len(progress["incidents"]["completed_seeds_in_current_pass"]) >= len(INCIDENT_SEEDS)
+                    or inc_count >= TARGET_INCIDENTS):
+                if pass_idx >= progress["incidents"]["completed_passes"]:
+                    progress["incidents"]["completed_passes"]                = pass_idx + 1
+                    progress["incidents"]["completed_seeds_in_current_pass"] = []
+                    save_progress(progress)
+
+            print(f"  Pass {pass_idx + 1} done | Incidents so far: {inc_count:,}")
+
+        if daily_limit_exhausted:
+            print("Generation paused. Rerun tomorrow to continue.")
+            return
 
         print(f"\nPhase 1 complete: {inc_count:,} incident tickets generated")
 
         # ── PHASE 2: DEVELOPMENT REQUEST TICKETS ──────────────────────────
-        # Calculate full passes over DEVELOPMENT_SEEDS required to hit TARGET_DEVELOPMENT (6,500).
-        # 18 seeds × 20 variations/pass = 360 tickets per pass.
-        # ceil(6,500 / 360) = 19 passes required.
-        DEV_PASSES = math.ceil(TARGET_DEVELOPMENT / (len(DEVELOPMENT_SEEDS) * VARIATIONS_PER_PASS))
-        print("\nPHASE 2: Generating development request tickets...")
-        print(f"Seeds: {len(DEVELOPMENT_SEEDS)} | Passes: {DEV_PASSES} | Target: {TARGET_DEVELOPMENT:,}")
+        # Development tickets go to incoming_tickets.csv only.
+        # They are NOT written to resolved_tickets.csv because they are
+        # feature requests that DistilBERT routes out at Step 0.
+        #
+        # Math: 18 seeds × 20 variations/pass = 360 per pass
+        # ceil(6,500 / 360) = 19 passes required
+
+        DEV_PASSES = math.ceil(
+            TARGET_DEVELOPMENT / (len(DEVELOPMENT_SEEDS) * VARIATIONS_PER_PASS)
+        )
+        print(f"\nPHASE 2: Generating {TARGET_DEVELOPMENT:,} development request tickets")
+        print(f"Seeds: {len(DEVELOPMENT_SEEDS)} | Passes: {DEV_PASSES} | "
+              f"Variations per call: {VARIATIONS_PER_PASS}")
         print("-" * 40)
+
+        # Restore count from checkpoint
+        dev_count = progress["development"]["total_count"]
 
         for pass_idx in range(DEV_PASSES):
             if dev_count >= TARGET_DEVELOPMENT:
                 break
-            print(f"\n--- Development Pass {pass_idx + 1}/{DEV_PASSES} ---")
-            for i, (module, seed_text) in enumerate(DEVELOPMENT_SEEDS):
-                if dev_count >= TARGET_DEVELOPMENT:
-                    break
-                print(f"[{i+1}/{len(DEVELOPMENT_SEEDS)}] {module}", end="")
 
-                # Generate development request variations using the LLM via Groq API
-                variations = generate_development_variations(
-                    seed_text = seed_text,
-                    module    = module,
-                    count     = VARIATIONS_PER_PASS,
-                )
+            completed_passes = progress["development"]["completed_passes"]
+            if pass_idx < completed_passes:
+                continue
 
-                print(f" -> {len(variations)} tickets")
+            # ── PASS RETRY LOOP ──────────────────────────────────────────────
+            # WHY THIS EXISTS: Tracks consecutive empty/failed iterations across all seeds in a pass.
+            # If rate limits or API outages cause 5 consecutive iterations where zero seeds succeed,
+            # we break gracefully to avoid infinite loops and allow resuming later.
+            consecutive_empty_passes = 0
+            while (len(progress["development"]["completed_seeds_in_current_pass"]) < len(DEVELOPMENT_SEEDS)
+                   and dev_count < TARGET_DEVELOPMENT):
 
-                for ticket_text in variations:
+                missing_indices = [
+                    i for i in range(len(DEVELOPMENT_SEEDS))
+                    if i not in progress["development"]["completed_seeds_in_current_pass"]
+                ]
+
+                seed_succeeded_this_iter = False
+                for seed_idx in missing_indices:
                     if dev_count >= TARGET_DEVELOPMENT:
                         break
-                    ticket_id = f"DEV-{ticket_counter:06d}"
-                    ticket_counter += 1
 
-                    # Development requests only go to incoming CSV
-                    # They do NOT go to resolved tickets CSV because they are not
-                    # support incidents — they are feature requests that get
-                    # routed out by DistilBERT at Step 0
-                    inc_writer.writerow({
-                        "ticket_id":     ticket_id,
-                        "text":          ticket_text,
-                        "ticket_type":   "development",
-                        "module":        module,
-                        "issue_type":    "",       # No issue type for dev requests
-                        "has_error_code": False,
-                        "error_code":    "",
-                    })
+                    module, seed_text = DEVELOPMENT_SEEDS[seed_idx]
 
-                    total_incoming += 1
-                    dev_count += 1
+                    print(f"  Pass {pass_idx + 1}/{DEV_PASSES} | "
+                          f"Seed {seed_idx + 1}/{len(DEVELOPMENT_SEEDS)} | "
+                          f"{module}", end="")
 
-                # Small delay to avoid Groq rate limiting
-                time.sleep(2)
+                    # Generate development request variations via Groq API
+                    variations = generate_development_variations(
+                        seed_text = seed_text,
+                        module    = module,
+                    )
+
+                    print(f" -> {len(variations)} tickets")
+
+                    if not variations or len(variations) < int(VARIATIONS_PER_PASS * 0.75):
+                        print(f"  WARNING: Seed {seed_idx + 1} in Pass {pass_idx + 1} "
+                              f"did not return sufficient variations (>=75%) — retrying seed")
+                        continue
+
+                    for ticket_text in variations:
+                        if dev_count >= TARGET_DEVELOPMENT:
+                            break
+
+                        ticket_id = f"DEV-{ticket_counter:06d}"
+                        ticket_counter += 1
+
+                        # Development requests go to incoming CSV only (no resolved record)
+                        inc_writer.writerow({
+                            "ticket_id":      ticket_id,
+                            "text":           ticket_text,
+                            "ticket_type":    "development",
+                            "module":         module,
+                            "issue_type":     "",      # No issue type for dev requests
+                            "has_error_code": False,
+                            "error_code":     "",
+                        })
+                        dev_count += 1
+
+                    # Flush incoming only — resolved not written for dev requests
+                    inc_file.flush()
+                    os.fsync(inc_file.fileno())
+
+                    # Save progress after confirmed disk write
+                    if seed_idx not in progress["development"]["completed_seeds_in_current_pass"]:
+                        progress["development"]["completed_seeds_in_current_pass"].append(seed_idx)
+                    progress["development"]["total_count"] = dev_count
+                    save_progress(progress)
+
+                    seed_succeeded_this_iter = True
+
+                    # 5 second delay between API calls — respects 15 RPM free tier limit
+                    time.sleep(5)
+
+                if seed_succeeded_this_iter:
+                    consecutive_empty_passes = 0
+                else:
+                    consecutive_empty_passes += 1
+
+                if consecutive_empty_passes >= 5:
+                    print("\n" + "=" * 55)
+                    print("DAILY RATE LIMIT EXHAUSTED")
+                    print("All seeds returned empty 5 consecutive times.")
+                    print("Progress saved. Run script again tomorrow.")
+                    print("Current progress:")
+                    print(f"  Incidents:   {inc_count:,} / {TARGET_INCIDENTS:,}")
+                    print(f"  Development: {dev_count:,} / {TARGET_DEVELOPMENT:,}")
+                    print(f"  Edge Cases:  {edge_count:,} / {TARGET_EDGE_CASES:,}")
+                    print("=" * 55)
+                    daily_limit_exhausted = True
+                    break
+
+                remaining = len(DEVELOPMENT_SEEDS) - len(progress["development"]["completed_seeds_in_current_pass"])
+                if remaining > 0 and dev_count < TARGET_DEVELOPMENT:
+                    print(f"  [Pass {pass_idx + 1}] Retrying {remaining} uncompleted development seed(s)...")
+                    time.sleep(3)
+
+            if daily_limit_exhausted:
+                break
+
+            # ── END OF PASS ────────────────────────────────────────────────
+            if (len(progress["development"]["completed_seeds_in_current_pass"]) >= len(DEVELOPMENT_SEEDS)
+                    or dev_count >= TARGET_DEVELOPMENT):
+                if pass_idx >= progress["development"]["completed_passes"]:
+                    progress["development"]["completed_passes"]                = pass_idx + 1
+                    progress["development"]["completed_seeds_in_current_pass"] = []
+                    save_progress(progress)
+
+            print(f"  Pass {pass_idx + 1} done | Development so far: {dev_count:,}")
+
+        if daily_limit_exhausted:
+            print("Generation paused. Rerun tomorrow to continue.")
+            return
 
         print(f"\nPhase 2 complete: {dev_count:,} development request tickets generated")
 
         # ── PHASE 3: EDGE CASE TICKETS ────────────────────────────────────
-        # Calculate full passes over EDGE_CASE_SEEDS required to hit TARGET_EDGE_CASES (3,500).
-        # 15 seeds × 20 variations/pass = 300 tickets per pass.
-        # ceil(3,500 / 300) = 12 passes required.
-        EDGE_PASSES = math.ceil(TARGET_EDGE_CASES / (len(EDGE_CASE_SEEDS) * VARIATIONS_PER_PASS))
-        print("\nPHASE 3: Generating edge case tickets...")
-        print(f"Seeds: {len(EDGE_CASE_SEEDS)} | Passes: {EDGE_PASSES} | Target: {TARGET_EDGE_CASES:,}")
+        # Edge cases use generate_incoming_variations() — NOT generate_development_variations().
+        # They are deliberate ambiguous/vague incidents, not dev requests.
+        # They DO get resolved records, same as Phase 1.
+        #
+        # Math: 15 seeds × 20 variations/pass = 300 per pass
+        # ceil(3,500 / 300) = 12 passes required
+
+        EDGE_PASSES = math.ceil(
+            TARGET_EDGE_CASES / (len(EDGE_CASE_SEEDS) * VARIATIONS_PER_PASS)
+        )
+        print(f"\nPHASE 3: Generating {TARGET_EDGE_CASES:,} edge case tickets")
+        print(f"Seeds: {len(EDGE_CASE_SEEDS)} | Passes: {EDGE_PASSES} | "
+              f"Variations per call: {VARIATIONS_PER_PASS}")
         print("-" * 40)
+
+        # Restore count from checkpoint
+        edge_count = progress["edge_cases"]["total_count"]
 
         for pass_idx in range(EDGE_PASSES):
             if edge_count >= TARGET_EDGE_CASES:
                 break
-            print(f"\n--- Edge Case Pass {pass_idx + 1}/{EDGE_PASSES} ---")
-            for i, (module, issue_type, has_error_code, seed_text) in enumerate(EDGE_CASE_SEEDS):
-                if edge_count >= TARGET_EDGE_CASES:
-                    break
-                print(f"[{i+1}/{len(EDGE_CASE_SEEDS)}] {module} - {issue_type}", end="")
 
-                error_code = ""
-                if has_error_code:
-                    error_code = random.choice(ERROR_CODES.get(module, ["SY 001"]))
+            completed_passes = progress["edge_cases"]["completed_passes"]
+            if pass_idx < completed_passes:
+                continue
 
-                # Edge cases use the same variation generation as incidents (via Groq API call)
-                # but the seeds themselves are deliberately ambiguous, vague, or cross-module
-                variations = generate_incoming_variations(
-                    seed_text      = seed_text,
-                    module         = module,
-                    issue_type     = issue_type,
-                    has_error_code = has_error_code,
-                    error_code     = error_code,
-                    count          = VARIATIONS_PER_PASS,
-                )
+            # ── PASS RETRY LOOP ──────────────────────────────────────────────
+            # WHY THIS EXISTS: Tracks consecutive empty/failed iterations across all seeds in a pass.
+            # If rate limits or API outages cause 5 consecutive iterations where zero seeds succeed,
+            # we break gracefully to avoid infinite loops and allow resuming later.
+            consecutive_empty_passes = 0
+            while (len(progress["edge_cases"]["completed_seeds_in_current_pass"]) < len(EDGE_CASE_SEEDS)
+                   and edge_count < TARGET_EDGE_CASES):
 
-                print(f" -> {len(variations)} tickets")
+                missing_indices = [
+                    i for i in range(len(EDGE_CASE_SEEDS))
+                    if i not in progress["edge_cases"]["completed_seeds_in_current_pass"]
+                ]
 
-                for ticket_text in variations:
+                seed_succeeded_this_iter = False
+                for seed_idx in missing_indices:
                     if edge_count >= TARGET_EDGE_CASES:
                         break
-                    ticket_id = f"EDG-{ticket_counter:06d}"
-                    ticket_counter += 1
 
-                    # Write to incoming tickets CSV
-                    inc_writer.writerow({
-                        "ticket_id":     ticket_id,
-                        "text":          ticket_text,
-                        "ticket_type":   "edge_case",
-                        "module":        module,
-                        "issue_type":    issue_type,
-                        "has_error_code": has_error_code,
-                        "error_code":    error_code,
-                    })
+                    module, issue_type, has_error_code, seed_text = EDGE_CASE_SEEDS[seed_idx]
 
-                    # Edge cases also get resolved ticket records
-                    # because the RAG knowledge base needs to know how to handle them
-                    resolved = build_resolved_record(
-                        incoming_text = ticket_text,
-                        module        = module,
-                        issue_type    = issue_type,
-                        error_code    = error_code,
-                        ticket_id     = ticket_id,
+                    error_code = ""
+                    if has_error_code:
+                        error_code = random.choice(ERROR_CODES.get(module, ["SY 001"]))
+
+                    print(f"  Pass {pass_idx + 1}/{EDGE_PASSES} | "
+                          f"Seed {seed_idx + 1}/{len(EDGE_CASE_SEEDS)} | "
+                          f"{module} - {issue_type}", end="")
+
+                    # Edge cases use generate_incoming_variations() — the seeds are
+                    # deliberately ambiguous/vague/cross-module incident-style tickets
+                    variations = generate_incoming_variations(
+                        seed_text      = seed_text,
+                        module         = module,
+                        issue_type     = issue_type,
+                        has_error_code = has_error_code,
+                        error_code     = error_code,
                     )
-                    resolved["ticket_type"] = "edge_case"
-                    res_writer.writerow(resolved)
 
-                    total_incoming += 1
-                    total_resolved += 1
-                    edge_count += 1
+                    print(f" -> {len(variations)} tickets")
 
-                # Small delay to avoid Groq rate limiting
-                time.sleep(2)
+                    if not variations or len(variations) < int(VARIATIONS_PER_PASS * 0.75):
+                        print(f"  WARNING: Seed {seed_idx + 1} in Pass {pass_idx + 1} "
+                              f"did not return sufficient variations (>=75%) — retrying seed")
+                        continue
+
+                    for ticket_text in variations:
+                        if edge_count >= TARGET_EDGE_CASES:
+                            break
+
+                        ticket_id = f"EDG-{ticket_counter:06d}"
+                        ticket_counter += 1
+
+                        # Write to incoming tickets CSV
+                        inc_writer.writerow({
+                            "ticket_id":      ticket_id,
+                            "text":           ticket_text,
+                            "ticket_type":    "edge_case",
+                            "module":         module,
+                            "issue_type":     issue_type,
+                            "has_error_code": has_error_code,
+                            "error_code":     error_code,
+                        })
+
+                        # Edge cases also get resolved ticket records
+                        # because the RAG knowledge base needs to handle them
+                        resolved = build_resolved_record(
+                            incoming_text = ticket_text,
+                            module        = module,
+                            issue_type    = issue_type,
+                            error_code    = error_code,
+                            ticket_id     = ticket_id,
+                        )
+                        resolved["ticket_type"] = "edge_case"
+                        res_writer.writerow(resolved)
+                        edge_count += 1
+
+                    # Flush both files then save progress
+                    inc_file.flush()
+                    os.fsync(inc_file.fileno())
+                    res_file.flush()
+                    os.fsync(res_file.fileno())
+
+                    # Save progress after confirmed disk write
+                    if seed_idx not in progress["edge_cases"]["completed_seeds_in_current_pass"]:
+                        progress["edge_cases"]["completed_seeds_in_current_pass"].append(seed_idx)
+                    progress["edge_cases"]["total_count"] = edge_count
+                    save_progress(progress)
+
+                    seed_succeeded_this_iter = True
+
+                    # 5 second delay between API calls — respects 15 RPM free tier limit
+                    time.sleep(5)
+
+                if seed_succeeded_this_iter:
+                    consecutive_empty_passes = 0
+                else:
+                    consecutive_empty_passes += 1
+
+                if consecutive_empty_passes >= 5:
+                    print("\n" + "=" * 55)
+                    print("DAILY RATE LIMIT EXHAUSTED")
+                    print("All seeds returned empty 5 consecutive times.")
+                    print("Progress saved. Run script again tomorrow.")
+                    print("Current progress:")
+                    print(f"  Incidents:   {inc_count:,} / {TARGET_INCIDENTS:,}")
+                    print(f"  Development: {dev_count:,} / {TARGET_DEVELOPMENT:,}")
+                    print(f"  Edge Cases:  {edge_count:,} / {TARGET_EDGE_CASES:,}")
+                    print("=" * 55)
+                    daily_limit_exhausted = True
+                    break
+
+                remaining = len(EDGE_CASE_SEEDS) - len(progress["edge_cases"]["completed_seeds_in_current_pass"])
+                if remaining > 0 and edge_count < TARGET_EDGE_CASES:
+                    print(f"  [Pass {pass_idx + 1}] Retrying {remaining} uncompleted edge case seed(s)...")
+                    time.sleep(3)
+
+            if daily_limit_exhausted:
+                break
+
+            # ── END OF PASS ────────────────────────────────────────────────
+            if (len(progress["edge_cases"]["completed_seeds_in_current_pass"]) >= len(EDGE_CASE_SEEDS)
+                    or edge_count >= TARGET_EDGE_CASES):
+                if pass_idx >= progress["edge_cases"]["completed_passes"]:
+                    progress["edge_cases"]["completed_passes"]                = pass_idx + 1
+                    progress["edge_cases"]["completed_seeds_in_current_pass"] = []
+                    save_progress(progress)
+
+            print(f"  Pass {pass_idx + 1} done | Edge cases so far: {edge_count:,}")
+
+        if daily_limit_exhausted:
+            print("Generation paused. Rerun tomorrow to continue.")
+            return
 
         print(f"\nPhase 3 complete: {edge_count:,} edge case tickets generated")
 
     # ── FINAL SUMMARY ─────────────────────────────────────────────────────
-    print("\n" + "=" * 60)
+    # total_resolved = incidents + edge_cases only — dev requests have no resolved records
+    total_incoming = inc_count + dev_count + edge_count
+    total_resolved = inc_count + edge_count
+    print("\n" + "=" * 55)
     print("GENERATION COMPLETE")
-    print("=" * 60)
+    print("=" * 55)
     print(f"Total incoming tickets:  {total_incoming:,}")
     print(f"  Incident tickets:      {inc_count:,}")
     print(f"  Development requests:  {dev_count:,}")
@@ -1372,11 +1947,104 @@ def generate_all_tickets():
     print(f"\nFiles written:")
     print(f"  {INCOMING_CSV}")
     print(f"  {RESOLVED_CSV}")
-    print("=" * 60)
+    print("=" * 55)
+
+
+# =============================================================================
+# RECONCILIATION FUNCTION
+# Safety net to patch any gaps between incoming and resolved CSVs.
+# Gaps can occur from mid-write interruptions even with os.fsync().
+# =============================================================================
+
+def reconcile_resolved_tickets():
+    """
+    Compare incoming_tickets.csv against resolved_tickets.csv by ticket_id
+    and generate any missing resolved records.
+
+    WHY THIS EXISTS: Even with side-by-side generation and os.fsync(), edge
+    cases like mid-write interruption between the two CSV writes can leave
+    gaps. This function finds any incident or edge_case ticket in incoming
+    that has no matching record in resolved, then generates and appends them.
+
+    Development tickets are excluded — they never get resolved records.
+
+    Can be run standalone:
+        python generate_tickets.py --reconcile-only
+    """
+    print("\n" + "=" * 55)
+    print("RECONCILIATION — checking resolved vs incoming")
+    print("=" * 55)
+
+    if not os.path.exists(INCOMING_CSV):
+        print("incoming_tickets.csv not found — nothing to reconcile.")
+        return
+
+    # Collect all ticket_ids from incoming that need resolved records
+    incoming_ids  = {}
+    with open(INCOMING_CSV, "r", encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            if row["ticket_type"] in ("incident", "edge_case"):
+                incoming_ids[row["ticket_id"]] = row
+
+    # Collect all ticket_ids already in resolved
+    resolved_ids = set()
+    if os.path.exists(RESOLVED_CSV):
+        with open(RESOLVED_CSV, "r", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                resolved_ids.add(row["ticket_id"])
+
+    missing_ids = set(incoming_ids.keys()) - resolved_ids
+
+    print(f"Incoming incident + edge tickets: {len(incoming_ids):,}")
+    print(f"Existing resolved records:        {len(resolved_ids):,}")
+    print(f"Missing resolved records:         {len(missing_ids):,}")
+
+    if not missing_ids:
+        print("No gaps found. resolved_tickets.csv is complete.")
+        return
+
+    resolved_fields = [
+        "ticket_id", "module", "issue_type", "problem", "error_code",
+        "root_cause", "fix", "tcodes_used", "resolution_time_minutes",
+        "escalated", "created_date", "resolved_date", "ticket_type",
+    ]
+
+    with open(RESOLVED_CSV, "a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=resolved_fields)
+        for i, ticket_id in enumerate(sorted(missing_ids)):
+            row = incoming_ids[ticket_id]
+            resolved = build_resolved_record(
+                incoming_text = row["text"],
+                module        = row["module"],
+                issue_type    = row["issue_type"],
+                error_code    = row.get("error_code", ""),
+                ticket_id     = ticket_id,
+            )
+            resolved["ticket_type"] = row["ticket_type"]
+            writer.writerow(resolved)
+
+            # Print progress every 500 records for large reconciliation runs
+            if (i + 1) % 500 == 0:
+                print(f"  Reconciled {i + 1:,} / {len(missing_ids):,}...")
+
+    print(f"Reconciliation complete. Added {len(missing_ids):,} records to resolved_tickets.csv.")
 
 
 # =============================================================================
 # ENTRY POINT
 # =============================================================================
 if __name__ == "__main__":
-    generate_all_tickets()
+    # Usage:
+    #   python generate_tickets.py                  full generation with auto-resume
+    #   python generate_tickets.py --reconcile-only  fix resolved gaps only
+
+    if len(sys.argv) > 1 and sys.argv[1] == "--reconcile-only":
+        # Run only reconciliation — does not touch incoming_tickets.csv
+        reconcile_resolved_tickets()
+    else:
+        # Full generation — safe to run multiple times, auto-resumes from checkpoint
+        generate_all_tickets()
+        # Always reconcile after generation to catch any gaps from interruptions
+        reconcile_resolved_tickets()
+
+    

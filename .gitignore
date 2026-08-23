@@ -226,8 +226,10 @@ data/synthetic/*.csv
 chroma_db/
 node_modules/
 .next/
+generation_progress.json
 
 # Project context files — not part of codebase
 ARIA_Final_v5.md
 ARIA_Build_Plan.md
 RULES.md
+CONTEXT.md
