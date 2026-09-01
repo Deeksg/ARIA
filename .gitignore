@@ -222,6 +222,12 @@ venv/
 
 # ARIA specific gitignores
 backend/models/
+backend/models/distilbert_intake/
+backend/models/bert_classifier/
+backend/models/label_mappings.json
+notebooks/*.pt
+notebooks/*.zip
+notebooks/*.json
 data/synthetic/*.csv
 chroma_db/
 node_modules/
@@ -233,3 +239,4 @@ ARIA_Final_v5.md
 ARIA_Build_Plan.md
 RULES.md
 CONTEXT.md
+

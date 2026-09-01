@@ -6,3 +6,6 @@ seaborn
 jupyter
 notebook
 ipykernel
+transformers
+torch
+scikit-learn
