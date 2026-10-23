@@ -9,3 +9,6 @@ ipykernel
 transformers
 torch
 scikit-learn
+lightgbm
+joblib
+sentence-transformers

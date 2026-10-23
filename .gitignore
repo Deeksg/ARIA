@@ -224,6 +224,7 @@ venv/
 backend/models/
 backend/models/distilbert_intake/
 backend/models/bert_classifier/
+backend/models/lightgbm/
 backend/models/label_mappings.json
 notebooks/*.pt
 notebooks/*.zip
