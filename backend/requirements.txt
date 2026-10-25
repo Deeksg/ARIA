@@ -12,3 +12,8 @@ scikit-learn
 lightgbm
 joblib
 sentence-transformers
+chromadb
+python-docx
+pypdf
+pytest
+numpy
